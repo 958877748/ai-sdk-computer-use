@@ -1,10 +1,8 @@
 "use client";
 
 import { PreviewMessage } from "@/components/message";
-import { getDesktopURL } from "@/lib/e2b/utils";
 import { useScrollToBottom } from "@/lib/use-scroll-to-bottom";
-import { useChat } from "@ai-sdk/react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, FormEvent } from "react";
 import { Input } from "@/components/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -16,81 +14,121 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
-import { ABORTED } from "@/lib/utils";
+import type { UIMessage } from "ai";
+
+interface Message {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  parts: Array<{
+    type: "text" | "tool-invocation";
+    text?: string;
+    toolInvocation?: {
+      toolName: string;
+      state: "call" | "partial-call" | "result";
+      args: Record<string, unknown>;
+      result?: unknown;
+    };
+  }>;
+}
 
 export default function Chat() {
-  // Create separate refs for mobile and desktop to ensure both scroll properly
   const [desktopContainerRef, desktopEndRef] = useScrollToBottom();
-  const [mobileContainerRef, mobileEndRef] = useScrollToBottom();
 
   const [isInitializing, setIsInitializing] = useState(true);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [sandboxId, setSandboxId] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
 
-  const {
-    messages,
-    input,
-    handleInputChange,
-    handleSubmit,
-    status,
-    stop: stopGeneration,
-    append,
-    setMessages,
-  } = useChat({
-    api: "/api/chat",
-    id: sandboxId ?? undefined,
-    body: {
-      sandboxId,
-    },
-    maxSteps: 30,
-    onError: (error) => {
-      console.error(error);
-      toast.error("There was an error", {
-        description: "Please try again later.",
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInput(e.target.value);
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading || isInitializing || !sandboxId) return;
+    
+    const content = input.trim();
+    setInput("");
+    
+    // 添加用户消息
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: "user",
+      content,
+      parts: [{ type: "text", text: content }],
+    };
+    setMessages(prev => [...prev, userMessage]);
+    
+    // 准备发送请求
+    setIsLoading(true);
+    
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [...messages, userMessage].map(m => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            parts: m.parts,
+          })) as UIMessage[],
+          metadata: { sandboxId },
+        }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      // 添加 AI 回复
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: data.text || "",
+        parts: [{ type: "text", text: data.text || "" }],
+      };
+      
+      // 添加工具调用结果
+      if (data.toolResults && data.toolResults.length > 0) {
+        data.toolResults.forEach((result: { toolCallId: string; toolName: string; result: unknown }) => {
+          assistantMessage.parts.push({
+            type: "tool-invocation",
+            toolInvocation: {
+              toolName: result.toolName,
+              state: "result",
+              args: {},
+              result: result.result,
+            },
+          });
+        });
+      }
+      
+      setMessages(prev => [...prev, assistantMessage]);
+    } catch (error) {
+      console.error("Chat error:", error);
+      toast.error("发送消息失败", {
+        description: "请稍后重试。",
         richColors: true,
         position: "top-center",
       });
-    },
-  });
-
-  const stop = () => {
-    stopGeneration();
-
-    const lastMessage = messages.at(-1);
-    const lastMessageLastPart = lastMessage?.parts.at(-1);
-    if (
-      lastMessage?.role === "assistant" &&
-      lastMessageLastPart?.type === "tool-invocation"
-    ) {
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        {
-          ...lastMessage,
-          parts: [
-            ...lastMessage.parts.slice(0, -1),
-            {
-              ...lastMessageLastPart,
-              toolInvocation: {
-                ...lastMessageLastPart.toolInvocation,
-                state: "result",
-                result: ABORTED,
-              },
-            },
-          ],
-        },
-      ]);
+    } finally {
+      setIsLoading(false);
     }
   };
-
-  const isLoading = status !== "ready";
 
   const refreshDesktop = async () => {
     try {
       setIsInitializing(true);
-      const { streamUrl, id } = await getDesktopURL(sandboxId || undefined);
-      // console.log("Refreshed desktop connection with ID:", id);
-      setStreamUrl(streamUrl);
-      setSandboxId(id);
+      const res = await fetch("/api/desktop");
+      const data = await res.json();
+      setStreamUrl(data.streamUrl);
+      setSandboxId(data.sandboxId);
     } catch (err) {
       console.error("Failed to refresh desktop:", err);
     } finally {
@@ -98,82 +136,59 @@ export default function Chat() {
     }
   };
 
-  // Kill desktop on page close
   useEffect(() => {
     if (!sandboxId) return;
 
-    // Function to kill the desktop - just one method to reduce duplicates
     const killDesktop = () => {
       if (!sandboxId) return;
-
-      // Use sendBeacon which is best supported across browsers
       navigator.sendBeacon(
         `/api/kill-desktop?sandboxId=${encodeURIComponent(sandboxId)}`,
       );
     };
 
-    // Detect iOS / Safari
     const isIOS =
       /iPad|iPhone|iPod/.test(navigator.userAgent) ||
       (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
-    // Choose exactly ONE event handler based on the browser
     if (isIOS || isSafari) {
-      // For Safari on iOS, use pagehide which is most reliable
       window.addEventListener("pagehide", killDesktop);
-
       return () => {
         window.removeEventListener("pagehide", killDesktop);
-        // Also kill desktop when component unmounts
         killDesktop();
       };
     } else {
-      // For all other browsers, use beforeunload
       window.addEventListener("beforeunload", killDesktop);
-
       return () => {
         window.removeEventListener("beforeunload", killDesktop);
-        // Also kill desktop when component unmounts
         killDesktop();
       };
     }
   }, [sandboxId]);
 
   useEffect(() => {
-    // Initialize desktop and get stream URL when the component mounts
     const init = async () => {
       try {
         setIsInitializing(true);
-
-        // Use the provided ID or create a new one
-        const { streamUrl, id } = await getDesktopURL(sandboxId ?? undefined);
-
-        setStreamUrl(streamUrl);
-        setSandboxId(id);
+        const res = await fetch("/api/desktop");
+        const data = await res.json();
+        setStreamUrl(data.streamUrl);
+        setSandboxId(data.sandboxId);
       } catch (err) {
         console.error("Failed to initialize desktop:", err);
-        toast.error("Failed to initialize desktop");
+        toast.error("初始化桌面失败");
       } finally {
         setIsInitializing(false);
       }
     };
 
     init();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <div className="flex h-dvh relative">
-      {/* Mobile/tablet banner */}
-      <div className="flex items-center justify-center fixed left-1/2 -translate-x-1/2 top-5 shadow-md text-xs mx-auto rounded-lg h-8 w-fit bg-blue-600 text-white px-3 py-2 text-left z-50 xl:hidden">
-        <span>Headless mode</span>
-      </div>
-
-      {/* Resizable Panels */}
-      <div className="w-full hidden xl:block">
+      <div className="w-full block">
         <ResizablePanelGroup direction="horizontal" className="h-full">
-          {/* Desktop Stream Panel */}
           <ResizablePanel
             defaultSize={70}
             minSize={40}
@@ -196,21 +211,20 @@ export default function Chat() {
                   className="absolute top-2 right-2 bg-black/50 hover:bg-black/70 text-white px-3 py-1 rounded text-sm z-10"
                   disabled={isInitializing}
                 >
-                  {isInitializing ? "Creating desktop..." : "New desktop"}
+                  {isInitializing ? "创建桌面中..." : "新建桌面"}
                 </Button>
               </>
             ) : (
               <div className="flex items-center justify-center h-full text-white">
                 {isInitializing
-                  ? "Initializing desktop..."
-                  : "Loading stream..."}
+                  ? "正在初始化桌面..."
+                  : "加载流中..."}
               </div>
             )}
           </ResizablePanel>
 
           <ResizableHandle withHandle />
 
-          {/* Chat Interface Panel */}
           <ResizablePanel
             defaultSize={30}
             minSize={25}
@@ -228,10 +242,10 @@ export default function Chat() {
               {messages.length === 0 ? <ProjectInfo /> : null}
               {messages.map((message, i) => (
                 <PreviewMessage
-                  message={message}
+                  message={message as unknown as import("ai").UIMessage}
                   key={message.id}
                   isLoading={isLoading}
-                  status={status}
+                  status={isLoading ? "streaming" : "ready"}
                   isLatestMessage={i === messages.length - 1}
                 />
               ))}
@@ -240,10 +254,15 @@ export default function Chat() {
 
             {messages.length === 0 && (
               <PromptSuggestions
-                disabled={isInitializing}
-                submitPrompt={(prompt: string) =>
-                  append({ role: "user", content: prompt })
-                }
+                disabled={isInitializing || isLoading}
+                submitPrompt={(prompt: string) => {
+                  setInput(prompt);
+                  // 使用 setTimeout 确保 input 已更新
+                  setTimeout(() => {
+                    const fakeEvent = { preventDefault: () => {} } as FormEvent;
+                    handleSubmit(fakeEvent);
+                  }, 0);
+                }}
               />
             )}
             <div className="bg-white">
@@ -253,59 +272,13 @@ export default function Chat() {
                   input={input}
                   isInitializing={isInitializing}
                   isLoading={isLoading}
-                  status={status}
-                  stop={stop}
+                  status={isLoading ? "streaming" : "ready"}
+                  stop={() => {}}
                 />
               </form>
             </div>
           </ResizablePanel>
         </ResizablePanelGroup>
-      </div>
-
-      {/* Mobile View (Chat Only) */}
-      <div className="w-full xl:hidden flex flex-col">
-        <div className="bg-white py-4 px-4 flex justify-between items-center">
-          <AISDKLogo />
-          <DeployButton />
-        </div>
-
-        <div
-          className="flex-1 space-y-6 py-4 overflow-y-auto px-4"
-          ref={mobileContainerRef}
-        >
-          {messages.length === 0 ? <ProjectInfo /> : null}
-          {messages.map((message, i) => (
-            <PreviewMessage
-              message={message}
-              key={message.id}
-              isLoading={isLoading}
-              status={status}
-              isLatestMessage={i === messages.length - 1}
-            />
-          ))}
-          <div ref={mobileEndRef} className="pb-2" />
-        </div>
-
-        {messages.length === 0 && (
-          <PromptSuggestions
-            disabled={isInitializing}
-            submitPrompt={(prompt: string) =>
-              append({ role: "user", content: prompt })
-            }
-          />
-        )}
-        <div className="bg-white">
-          <form onSubmit={handleSubmit} className="p-4">
-            <Input
-              handleInputChange={handleInputChange}
-              input={input}
-              isInitializing={isInitializing}
-              isLoading={isLoading}
-              status={status}
-              stop={stop}
-            />
-          </form>
-        </div>
       </div>
     </div>
   );

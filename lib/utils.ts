@@ -8,6 +8,15 @@ export function cn(...inputs: ClassValue[]) {
 
 export const ABORTED = "User aborted";
 
+type ToolInvocationPart = {
+  type: "tool-invocation";
+  toolInvocation: {
+    toolName: string;
+    args: Record<string, unknown>;
+    result?: unknown;
+  };
+};
+
 export const prunedMessages = (messages: UIMessage[]): UIMessage[] => {
   if (messages.at(-1)?.role === "assistant") {
     return messages;
@@ -17,14 +26,15 @@ export const prunedMessages = (messages: UIMessage[]): UIMessage[] => {
     // check if last message part is a tool invocation in a call state, then append a part with the tool result
     message.parts = message.parts.map((part) => {
       if (part.type === "tool-invocation") {
+        const toolPart = part as unknown as ToolInvocationPart;
         if (
-          part.toolInvocation.toolName === "computer" &&
-          part.toolInvocation.args.action === "screenshot"
+          toolPart.toolInvocation.toolName === "computer" &&
+          toolPart.toolInvocation.args.action === "screenshot"
         ) {
           return {
             ...part,
             toolInvocation: {
-              ...part.toolInvocation,
+              ...toolPart.toolInvocation,
               result: {
                 type: "text",
                 text: "Image redacted to save input tokens",
